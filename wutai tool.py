@@ -22,7 +22,7 @@ import time
 import traceback
 import concurrent.futures
 from queue import Queue
-from PIL import Image
+from PIL import Image, ImageOps
 
 # 配置moviepy使用imageio_ffmpeg（对打包后的exe很重要）
 try:
@@ -255,7 +255,7 @@ class StageAnimationTool:
         plt.rcParams['axes.grid'] = False
         
         self.root = root
-        self.root.title("舞台走位动画制作工具 v2.8")
+        self.root.title("舞台走位动画制作工具 v3.0 | @天云 免费制作及分享 | QQ:1248360754 | 小红书:5615193523")
         
         # 设置窗口最小尺寸，避免内容变化导致窗口跳动
         self.root.minsize(1400, 800)
@@ -286,6 +286,19 @@ class StageAnimationTool:
         # 舞台参数
         self.stage_width = 20
         self.stage_height = 15
+        self.stage_background_path = None
+        self.stage_background_image = None
+        self.stage_background_bounds = None
+        self.stage_background_adjust_enabled = tk.BooleanVar(value=False)
+        self.background_dragging = False
+        self.background_drag_handle = None
+        self.background_drag_start = None
+        self.background_drag_start_bounds = None
+        self.background_ratio_resize_axis = None
+        self.background_keep_ratio_active = False
+        self.background_drag_view_range = None
+        self.background_drag_pixel_bounds = None
+        self.shift_pressed = False
         
         # 动画控制
         self.fps = 60  # 每秒帧数
@@ -321,6 +334,11 @@ class StageAnimationTool:
         self.drag_end_pos = None
         self.last_dragged_item = None  # 保存最后拖动的项目
         self.last_dragged_pos = None   # 保存最后拖动的位置
+        self.drag_start_mouse_pos = None
+        self.drag_last_mouse_pos = None
+        self.drag_start_pixel_pos = None
+        self.drag_last_pixel_pos = None
+        self.drag_jitter_pixel_threshold = 2.0
         
         # 多选功能
         self.selected_items = []  # 存储选中的多个对象 [{item, type, index, start_pos}]
@@ -341,6 +359,8 @@ class StageAnimationTool:
         self.rect_selecting = False  # 是否正在进行矩形框选
         self.rect_select_start = None  # 矩形框选起始点 (x, y)
         self.rect_select_end = None  # 矩形框选结束点 (x, y)
+        self.rect_select_view_range = None  # 框选时锁定视图范围，避免坐标跳动
+        self.rect_select_pixel_bounds = None  # 框选开始时的像素坐标映射
         
         # 智能对齐吸附功能
         self.snap_threshold = 0.5  # 吸附阈值（距离小于此值时吸附）
@@ -355,6 +375,7 @@ class StageAnimationTool:
         self.grid_linewidth = 0.5  # 线宽
         self.grid_color = 'black'  # 颜色
         self.grid_alpha = 0.3  # 透明度
+        self.custom_guides = []  # 自定义辅助线 [{'axis': 'x'|'y', 'value': float}]
         
         # 时间轴控制
         self.is_time_scale_updating = False  # 添加标志位防止递归
@@ -387,6 +408,9 @@ class StageAnimationTool:
         self.redo_stack = []  # 重做栈，用于Ctrl+Y重做
         self.max_history = 20  # 最大历史记录数
         self._drag_history_saved = False  # 拖动历史保存标志
+        self._last_undo_time = 0
+        self._last_redo_time = 0
+        self.drag_selection_count = 0
         
         # 颜色映射字典
         self.color_map = {
@@ -435,14 +459,18 @@ class StageAnimationTool:
         self.root.bind('<Control-Y>', self.redo_last_operation)
         
         # 绑定旋转快捷键（Q逆时针，E顺时针）
-        self.root.bind('q', lambda e: self.quick_rotate(-15))
-        self.root.bind('Q', lambda e: self.quick_rotate(-15))
-        self.root.bind('e', lambda e: self.quick_rotate(15))
-        self.root.bind('E', lambda e: self.quick_rotate(15))
+        self.root.bind('q', lambda e: self.handle_quick_rotate_shortcut(e, -15))
+        self.root.bind('Q', lambda e: self.handle_quick_rotate_shortcut(e, -15))
+        self.root.bind('e', lambda e: self.handle_quick_rotate_shortcut(e, 15))
+        self.root.bind('E', lambda e: self.handle_quick_rotate_shortcut(e, 15))
+        self.root.bind('<KeyPress-Shift_L>', lambda e: self.set_shift_pressed(True))
+        self.root.bind('<KeyPress-Shift_R>', lambda e: self.set_shift_pressed(True))
+        self.root.bind('<KeyRelease-Shift_L>', lambda e: self.set_shift_pressed(False))
+        self.root.bind('<KeyRelease-Shift_R>', lambda e: self.set_shift_pressed(False))
         
         # 显示欢迎消息
         self.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", 'info')
-        self.log("舞台走位动画制作工具 v2.8", 'info')
+        self.log("舞台走位动画制作工具 v3.0", 'info')
         self.log("音频支持：WAV/MP3", 'info')
         self.log("快捷键：Ctrl+Z撤销 | Ctrl+Y重做 | 空格播放/暂停", 'info')
         self.log("快捷键：Ctrl+C / Ctrl+V复制对象 | Delete删除对象", 'info')
@@ -470,6 +498,9 @@ class StageAnimationTool:
             'props': copy.deepcopy(self.props),
             'text_box': copy.deepcopy(self.text_box),
             'textboxes': copy.deepcopy(self.textboxes),  # 添加新版文本框系统
+            'stage_background_path': self.stage_background_path,
+            'stage_background_bounds': copy.deepcopy(self.stage_background_bounds),
+            'custom_guides': copy.deepcopy(self.custom_guides),
             'current_frame': self.current_frame,
             'current_second': self.current_second
         }
@@ -501,6 +532,27 @@ class StageAnimationTool:
         # 恢复新版文本框系统（兼容旧版历史记录）
         if 'textboxes' in state:
             self.textboxes = copy.deepcopy(state['textboxes'])
+        if 'stage_background_path' in state:
+            current_background_path = self.stage_background_path
+            current_background_image = self.stage_background_image
+            self.stage_background_path = state['stage_background_path']
+            if self.stage_background_path:
+                if (self.stage_background_path == current_background_path and
+                        current_background_image is not None):
+                    self.stage_background_image = current_background_image
+                    self.stage_background_bounds = copy.deepcopy(state.get('stage_background_bounds'))
+                elif self.load_stage_background_image(self.stage_background_path, show_errors=False):
+                    self.stage_background_bounds = copy.deepcopy(state.get('stage_background_bounds'))
+                else:
+                    self.stage_background_path = None
+                    self.stage_background_bounds = None
+            else:
+                self.load_stage_background_image(None, show_errors=False)
+                self.stage_background_bounds = None
+        if hasattr(self, 'remove_background_btn'):
+            self.remove_background_btn.config(state='normal' if self.stage_background_path else 'disabled')
+        self.custom_guides = self.normalize_custom_guides(state.get('custom_guides', []))
+        self.refresh_custom_guides_list()
         self.current_frame = state['current_frame']
         self.current_second = state['current_second']
         
@@ -526,9 +578,14 @@ class StageAnimationTool:
     
     def undo_last_operation(self, event=None):
         """撤销上一步操作 (Ctrl+Z)"""
+        now = time.time()
+        if event is not None and now - self._last_undo_time < 0.2:
+            return "break"
+        self._last_undo_time = now
+
         if len(self.history_stack) == 0:
             self.log("⚠️ 没有可以撤销的操作", 'warning')
-            return
+            return "break"
         
         import copy
         
@@ -539,6 +596,9 @@ class StageAnimationTool:
             'props': copy.deepcopy(self.props),
             'text_box': copy.deepcopy(self.text_box),
             'textboxes': copy.deepcopy(self.textboxes),  # 添加新版文本框系统
+            'stage_background_path': self.stage_background_path,
+            'stage_background_bounds': copy.deepcopy(self.stage_background_bounds),
+            'custom_guides': copy.deepcopy(self.custom_guides),
             'current_frame': self.current_frame,
             'current_second': self.current_second
         }
@@ -562,9 +622,14 @@ class StageAnimationTool:
     
     def redo_last_operation(self, event=None):
         """重做上一步撤销的操作 (Ctrl+Y)"""
+        now = time.time()
+        if event is not None and now - self._last_redo_time < 0.2:
+            return "break"
+        self._last_redo_time = now
+
         if len(self.redo_stack) == 0:
             self.log("⚠️ 没有可以重做的操作", 'warning')
-            return
+            return "break"
         
         import copy
         
@@ -575,6 +640,9 @@ class StageAnimationTool:
             'props': copy.deepcopy(self.props),
             'text_box': copy.deepcopy(self.text_box),
             'textboxes': copy.deepcopy(self.textboxes),  # 添加新版文本框系统
+            'stage_background_path': self.stage_background_path,
+            'stage_background_bounds': copy.deepcopy(self.stage_background_bounds),
+            'custom_guides': copy.deepcopy(self.custom_guides),
             'current_frame': self.current_frame,
             'current_second': self.current_second
         }
@@ -1206,6 +1274,32 @@ class StageAnimationTool:
         
         ttk.Button(grid_g, text="应用", width=10, 
                   command=self.apply_grid_interval).grid(row=4, column=0, columnspan=4, sticky='ew', padx=1, pady=1)
+
+        ttk.Separator(grid_g, orient='horizontal').grid(row=5, column=0, columnspan=4, sticky='ew', pady=(3, 2))
+        ttk.Label(grid_g, text="自定:").grid(row=6, column=0, sticky='e', padx=(0,1), pady=1)
+        self.custom_guide_axis_var = tk.StringVar(value="竖线X")
+        self.custom_guide_axis_combo = ttk.Combobox(
+            grid_g,
+            textvariable=self.custom_guide_axis_var,
+            values=["竖线X", "横线Y"],
+            width=5,
+            state="readonly"
+        )
+        self.custom_guide_axis_combo.grid(row=6, column=1, sticky='w', padx=0, pady=1)
+        self.custom_guide_value_entry = ttk.Entry(grid_g, width=7)
+        self.custom_guide_value_entry.grid(row=6, column=2, sticky='w', padx=0, pady=1)
+        ttk.Button(grid_g, text="添加", width=5,
+                  command=self.add_custom_guide).grid(row=6, column=3, sticky='w', padx=1, pady=1)
+
+        self.custom_guides_listbox = tk.Listbox(grid_g, height=3, exportselection=False)
+        self.custom_guides_listbox.grid(row=7, column=0, columnspan=4, sticky='ew', padx=1, pady=(1, 1))
+        custom_guide_btns = ttk.Frame(grid_g)
+        custom_guide_btns.grid(row=8, column=0, columnspan=4, sticky='ew', padx=1, pady=(0, 1))
+        ttk.Button(custom_guide_btns, text="删除选中", width=9,
+                  command=self.delete_selected_custom_guide).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(custom_guide_btns, text="清空", width=5,
+                  command=self.clear_custom_guides).pack(side=tk.LEFT)
+        self.refresh_custom_guides_list()
         
         grid_g.columnconfigure(0, weight=0)
         grid_g.columnconfigure(1, weight=0, minsize=0)  # 移除列1扩展以减小间距
@@ -1664,6 +1758,412 @@ class StageAnimationTool:
             print(error_msg)  # 打印详细错误信息
             messagebox.showerror("错误", error_msg)
 
+    def load_stage_background_image(self, file_path, show_errors=True):
+        """加载舞台背景图片到内存缓存。"""
+        if not file_path:
+            self.stage_background_image = None
+            return False
+
+        try:
+            with Image.open(file_path) as img:
+                img = ImageOps.exif_transpose(img).convert("RGBA")
+                self.stage_background_image = np.asarray(img).copy()
+            return True
+        except Exception as e:
+            self.stage_background_image = None
+            if show_errors:
+                messagebox.showerror("错误", f"导入背景图片失败: {str(e)}")
+            else:
+                print(f"背景图片加载失败: {file_path} | {e}")
+            return False
+
+    def get_default_stage_background_bounds(self):
+        """按图片原比例计算默认舞台背景范围。"""
+        if self.stage_background_image is None:
+            return None
+
+        image_height, image_width = self.stage_background_image.shape[:2]
+        if image_width <= 0 or image_height <= 0:
+            return None
+
+        image_ratio = image_width / image_height
+        stage_ratio = self.stage_width / self.stage_height
+
+        if image_ratio >= stage_ratio:
+            width = self.stage_width
+            height = width / image_ratio
+        else:
+            height = self.stage_height
+            width = height * image_ratio
+
+        return {
+            "center_x": 0.0,
+            "center_y": self.stage_height / 2,
+            "width": float(width),
+            "height": float(height)
+        }
+
+    def get_stage_background_bounds(self):
+        """获取有效的背景边界数据。"""
+        if self.stage_background_image is None:
+            return None
+
+        if not self.stage_background_bounds:
+            self.stage_background_bounds = self.get_default_stage_background_bounds()
+
+        if not self.stage_background_bounds:
+            return None
+
+        min_size = 0.2
+        bounds = self.stage_background_bounds
+        bounds["center_x"] = float(bounds.get("center_x", 0.0))
+        bounds["center_y"] = float(bounds.get("center_y", self.stage_height / 2))
+        bounds["width"] = max(min_size, abs(float(bounds.get("width", self.stage_width))))
+        bounds["height"] = max(min_size, abs(float(bounds.get("height", self.stage_height))))
+        return bounds
+
+    def get_stage_background_extent(self):
+        """获取背景图片绘制范围。"""
+        bounds = self.get_stage_background_bounds()
+        if not bounds:
+            return None
+
+        half_width = bounds["width"] / 2
+        half_height = bounds["height"] / 2
+        return (
+            bounds["center_x"] - half_width,
+            bounds["center_x"] + half_width,
+            bounds["center_y"] - half_height,
+            bounds["center_y"] + half_height
+        )
+
+    def get_stage_background_handle_size(self):
+        """根据当前视图计算背景控制点的尺寸。"""
+        try:
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            view_size = max(abs(xlim[1] - xlim[0]), abs(ylim[1] - ylim[0]))
+            return max(0.12, min(0.45, view_size * 0.015))
+        except Exception:
+            return 0.25
+
+    def get_stage_background_handles(self):
+        extent = self.get_stage_background_extent()
+        if not extent:
+            return {}
+
+        left, right, bottom, top = extent
+        mid_x = (left + right) / 2
+        mid_y = (bottom + top) / 2
+        return {
+            "nw": (left, top),
+            "n": (mid_x, top),
+            "ne": (right, top),
+            "e": (right, mid_y),
+            "se": (right, bottom),
+            "s": (mid_x, bottom),
+            "sw": (left, bottom),
+            "w": (left, mid_y)
+        }
+
+    def get_stage_background_hit_handle(self, x, y):
+        """判断鼠标是否命中背景控制点或边线。"""
+        handles = self.get_stage_background_handles()
+        if not handles:
+            return None
+
+        handle_size = self.get_stage_background_handle_size()
+        for name, (hx, hy) in handles.items():
+            if abs(x - hx) <= handle_size and abs(y - hy) <= handle_size:
+                return name
+
+        left, right, bottom, top = self.get_stage_background_extent()
+        in_x = left <= x <= right
+        in_y = bottom <= y <= top
+        edge_tolerance = handle_size * 0.9
+
+        if in_y and abs(x - left) <= edge_tolerance:
+            return "w"
+        if in_y and abs(x - right) <= edge_tolerance:
+            return "e"
+        if in_x and abs(y - top) <= edge_tolerance:
+            return "n"
+        if in_x and abs(y - bottom) <= edge_tolerance:
+            return "s"
+        return None
+
+    def is_point_in_stage_background(self, x, y):
+        """判断鼠标是否在背景图片内部。"""
+        extent = self.get_stage_background_extent()
+        if not extent:
+            return False
+
+        left, right, bottom, top = extent
+        return left <= x <= right and bottom <= y <= top
+
+    def set_shift_pressed(self, pressed):
+        """记录Shift键状态，避免拖动事件偶尔丢失修饰键状态。"""
+        self.shift_pressed = bool(pressed)
+        return None
+
+    def is_shift_pressed(self, event):
+        """兼容 Matplotlib/Tk 事件，稳定判断 Shift 是否按下。"""
+        if getattr(self, 'shift_pressed', False):
+            return True
+
+        key = getattr(event, 'key', None)
+        if key and 'shift' in str(key).lower():
+            return True
+
+        gui_event = getattr(event, 'guiEvent', None)
+        state = getattr(gui_event, 'state', 0)
+        try:
+            return bool(int(state) & 0x0001)
+        except (TypeError, ValueError):
+            return False
+
+    def resize_stage_background(self, x, y, keep_ratio=False):
+        """根据当前拖拽点更新背景图片大小。"""
+        if not self.background_drag_handle or not self.background_drag_start_bounds:
+            return
+
+        if keep_ratio and not self.background_keep_ratio_active:
+            self.background_keep_ratio_active = True
+            self.background_ratio_resize_axis = None
+            current_bounds = self.get_stage_background_bounds()
+            if current_bounds:
+                self.background_drag_start_bounds = dict(current_bounds)
+                self.background_drag_start = (x, y)
+        elif not keep_ratio:
+            self.background_keep_ratio_active = False
+            self.background_ratio_resize_axis = None
+
+        start = self.background_drag_start_bounds
+        left = start["center_x"] - start["width"] / 2
+        right = start["center_x"] + start["width"] / 2
+        bottom = start["center_y"] - start["height"] / 2
+        top = start["center_y"] + start["height"] / 2
+        handle = self.background_drag_handle
+        min_size = 0.2
+
+        if keep_ratio and self.stage_background_image is not None:
+            start_width = max(min_size, start["width"])
+            start_height = max(min_size, start["height"])
+            start_x, start_y = self.background_drag_start or (x, y)
+            ratio = start_width / start_height
+
+            proposed_width = start_width
+            proposed_height = start_height
+            if "e" in handle:
+                proposed_width = start_width + (x - start_x)
+            elif "w" in handle:
+                proposed_width = start_width - (x - start_x)
+
+            if "n" in handle:
+                proposed_height = start_height + (y - start_y)
+            elif "s" in handle:
+                proposed_height = start_height - (y - start_y)
+
+            proposed_width = max(min_size, proposed_width)
+            proposed_height = max(min_size, proposed_height)
+
+            if len(handle) == 2:
+                anchor_x = right if "w" in handle else left
+                anchor_y = top if "s" in handle else bottom
+                width_from_pointer = (anchor_x - x) if "w" in handle else (x - anchor_x)
+                height_from_pointer = (anchor_y - y) if "s" in handle else (y - anchor_y)
+                width_scale = max(min_size / start_width, width_from_pointer / start_width)
+                height_scale = max(min_size / start_height, height_from_pointer / start_height)
+
+                if self.background_ratio_resize_axis not in ("x", "y"):
+                    x_delta = abs(width_scale - 1.0)
+                    y_delta = abs(height_scale - 1.0)
+                    if max(x_delta, y_delta) >= 0.02:
+                        self.background_ratio_resize_axis = "x" if x_delta >= y_delta else "y"
+
+                if self.background_ratio_resize_axis == "x":
+                    scale = width_scale
+                elif self.background_ratio_resize_axis == "y":
+                    scale = height_scale
+                else:
+                    scale = max(width_scale, height_scale)
+                scale = max(min_size / start_width, min_size / start_height, scale)
+
+                width = start_width * scale
+                height = start_height * scale
+
+                if "w" in handle:
+                    new_left = anchor_x - width
+                    new_right = anchor_x
+                else:
+                    new_left = anchor_x
+                    new_right = anchor_x + width
+
+                if "s" in handle:
+                    new_bottom = anchor_y - height
+                    new_top = anchor_y
+                else:
+                    new_bottom = anchor_y
+                    new_top = anchor_y + height
+            elif handle in ("e", "w"):
+                width = proposed_width
+                height = width / ratio
+                center_y = start["center_y"]
+                new_bottom = center_y - height / 2
+                new_top = center_y + height / 2
+                if handle == "w":
+                    new_left = right - width
+                    new_right = right
+                else:
+                    new_left = left
+                    new_right = left + width
+            else:
+                height = proposed_height
+                width = height * ratio
+                center_x = start["center_x"]
+                new_left = center_x - width / 2
+                new_right = center_x + width / 2
+                if handle == "s":
+                    new_bottom = top - height
+                    new_top = top
+                else:
+                    new_bottom = bottom
+                    new_top = bottom + height
+
+            self.stage_background_bounds = {
+                "center_x": (new_left + new_right) / 2,
+                "center_y": (new_bottom + new_top) / 2,
+                "width": max(min_size, new_right - new_left),
+                "height": max(min_size, new_top - new_bottom)
+            }
+            return
+
+        self.background_ratio_resize_axis = None
+
+        new_left, new_right, new_bottom, new_top = left, right, bottom, top
+        if "w" in handle:
+            new_left = min(x, right - min_size)
+        if "e" in handle:
+            new_right = max(x, left + min_size)
+        if "s" in handle:
+            new_bottom = min(y, top - min_size)
+        if "n" in handle:
+            new_top = max(y, bottom + min_size)
+
+        width = max(min_size, new_right - new_left)
+        height = max(min_size, new_top - new_bottom)
+        self.stage_background_bounds = {
+            "center_x": (new_left + new_right) / 2,
+            "center_y": (new_bottom + new_top) / 2,
+            "width": width,
+            "height": height
+        }
+
+    def move_stage_background(self, x, y):
+        """拖动整张背景图片。"""
+        if not self.background_drag_start or not self.background_drag_start_bounds:
+            return
+
+        start = self.background_drag_start_bounds
+        start_x, start_y = self.background_drag_start
+        self.stage_background_bounds = {
+            "center_x": start["center_x"] + (x - start_x),
+            "center_y": start["center_y"] + (y - start_y),
+            "width": start["width"],
+            "height": start["height"]
+        }
+
+    def import_stage_background(self):
+        """导入图片作为舞台预览区域背景。"""
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"),
+                ("All files", "*.*")
+            ],
+            title="导入舞台背景图片"
+        )
+
+        if not file_path:
+            return
+
+        self.save_state_to_history("导入舞台背景")
+        if self.load_stage_background_image(file_path):
+            self.stage_background_path = file_path
+            self.stage_background_bounds = self.get_default_stage_background_bounds()
+            if hasattr(self, 'remove_background_btn'):
+                self.remove_background_btn.config(state='normal')
+            self.update_stage_preview()
+            self.log(f"✓ 舞台背景已导入: {os.path.basename(file_path)}", 'success')
+        else:
+            if self.history_stack:
+                self.history_stack.pop()
+
+    def remove_stage_background(self):
+        """删除当前舞台背景图片。"""
+        if not self.stage_background_path:
+            self.log("⚠️ 当前没有舞台背景图片", 'warning')
+            return
+
+        self.save_state_to_history("删除舞台背景")
+        self.stage_background_path = None
+        self.stage_background_image = None
+        self.stage_background_bounds = None
+        self.background_dragging = False
+        self.background_drag_handle = None
+        self.background_drag_start = None
+        self.background_drag_start_bounds = None
+        self.background_ratio_resize_axis = None
+        self.background_keep_ratio_active = False
+        self.background_drag_view_range = None
+        self.background_drag_pixel_bounds = None
+        if hasattr(self, 'remove_background_btn'):
+            self.remove_background_btn.config(state='disabled')
+        self.update_stage_preview()
+        self.log("✓ 舞台背景已删除", 'success')
+
+    def draw_stage_background(self, ax, show_controls=False):
+        """在舞台区域内绘制背景图片。"""
+        if self.stage_background_image is None:
+            return
+
+        extent = self.get_stage_background_extent()
+        if not extent:
+            return
+
+        ax.imshow(
+            self.stage_background_image,
+            extent=extent,
+            origin='upper',
+            zorder=-20
+        )
+
+        if show_controls:
+            left, right, bottom, top = extent
+            outline = Rectangle(
+                (left, bottom),
+                right - left,
+                top - bottom,
+                fill=False,
+                edgecolor='#0ea5e9',
+                linewidth=1.4,
+                linestyle='--',
+                zorder=60
+            )
+            ax.add_patch(outline)
+
+            handle_size = self.get_stage_background_handle_size()
+            for hx, hy in self.get_stage_background_handles().values():
+                handle = Rectangle(
+                    (hx - handle_size / 2, hy - handle_size / 2),
+                    handle_size,
+                    handle_size,
+                    facecolor='white',
+                    edgecolor='#0ea5e9',
+                    linewidth=1.2,
+                    zorder=61
+                )
+                ax.add_patch(handle)
+
     def create_stage_preview(self):
         # 创建中间区域的容器
         center_frame = ttk.Frame(self.main_frame)
@@ -1729,6 +2229,12 @@ class StageAnimationTool:
         # 批量插入关键帧按钮
         self.batch_insert_keyframe_btn = ttk.Button(snap_frame, text="批量插入关键帧", command=self.batch_insert_keyframe)
         self.batch_insert_keyframe_btn.pack(side=tk.LEFT, padx=10)
+
+        self.insert_time_btn = ttk.Button(snap_frame, text="插入时间", command=self.open_insert_time_dialog)
+        self.insert_time_btn.pack(side=tk.LEFT, padx=5)
+
+        self.delete_time_btn = ttk.Button(snap_frame, text="删除时间", command=self.open_delete_time_dialog)
+        self.delete_time_btn.pack(side=tk.LEFT, padx=5)
         
         # 对齐功能菜单按钮
         self.align_menu_btn = ttk.Menubutton(snap_frame, text="对齐 ▼")
@@ -1925,10 +2431,29 @@ class StageAnimationTool:
         
         self.remove_audio_btn = ttk.Button(project_row, text="删除音频", command=self.remove_audio)
         self.remove_audio_btn.pack(side=tk.LEFT, padx=2)
+
+        background_row = ttk.Frame(project_frame)
+        background_row.pack(fill=tk.X, padx=5, pady=(0, 3))
+
+        self.background_btn = ttk.Button(background_row, text="导入背景图片", command=self.import_stage_background)
+        self.background_btn.pack(side=tk.LEFT, padx=2)
+
+        self.remove_background_btn = ttk.Button(background_row, text="删除背景", command=self.remove_stage_background)
+        self.remove_background_btn.pack(side=tk.LEFT, padx=2)
+
+        self.background_adjust_checkbox = ttk.Checkbutton(
+            background_row,
+            text="背景调整",
+            variable=self.stage_background_adjust_enabled,
+            command=self.update_stage_preview
+        )
+        self.background_adjust_checkbox.pack(side=tk.LEFT, padx=8)
         
         # 初始状态：如果没有音频文件，禁用删除按钮
         if not hasattr(self, 'audio_file') or not self.audio_file:
             self.remove_audio_btn.config(state='disabled')
+        if not self.stage_background_path:
+            self.remove_background_btn.config(state='disabled')
         
         # 导出操作区域（合并导出设置与导出操作）
         export_frame = ttk.LabelFrame(right_frame, text="导出设置与操作")
@@ -1951,10 +2476,10 @@ class StageAnimationTool:
         self.export_btn = ttk.Button(export_row, text="导出GIF动画", command=self.export_animation)
         self.export_btn.pack(side=tk.LEFT, padx=2)
         
-        self.export_with_audio_btn = ttk.Button(export_row, text="导出带音频MP4", command=self.export_animation_with_audio)
+        self.export_with_audio_btn = ttk.Button(export_row, text="导出MP4动画", command=self.export_animation_with_audio)
         self.export_with_audio_btn.pack(side=tk.LEFT, padx=2)
         
-        # 创建日志输出窗口 - 在软件信息上方，固定高度（优化：减小高度）
+        # 创建日志输出窗口
         log_frame = ttk.LabelFrame(right_frame, text="操作日志", height=140)
         log_frame.pack(fill=tk.X, pady=5)
         log_frame.pack_propagate(False)  # 禁止子组件改变容器大小
@@ -1979,24 +2504,6 @@ class StageAnimationTool:
         self.log_text.tag_config('warning', foreground='#f0ad4e')  # 橙色 - 警告
         self.log_text.tag_config('error', foreground='#d9534f')  # 红色 - 错误
         self.log_text.tag_config('undo', foreground='#5bc0de')  # 蓝色 - 撤销/重做
-        
-        # 创建作者信息区域 - 移到时间轴下面
-        author_frame = ttk.LabelFrame(right_frame, text="软件信息")
-        author_frame.pack(fill=tk.X, pady=5)
-        
-        # 作者信息文本
-        author_info = """舞台走位动画制作工具 v2.8
-由@天云 免费制作及分享
-如有bug或好的优化建议，可联系：
-QQ：1248360754 小红书：5615193523"""
-        
-        author_label = tk.Label(author_frame, text=author_info, 
-                               justify='left', 
-                               font=('Microsoft YaHei', 9),
-                               fg='#333333',
-                               bg='#f0f0f0',
-                               padx=10, pady=8)
-        author_label.pack(fill=tk.X, padx=5, pady=5)
         
         # 为所有按钮绑定空格键，调用我们的切换函数而不是按钮的默认行为
         # 使用lambda包装以防止事件传播到按钮的默认处理器
@@ -2382,6 +2889,31 @@ QQ：1248360754 小红书：5615193523"""
             
         except ValueError:
             messagebox.showerror("错误", "请输入有效的旋转角度（数字）")
+
+    def is_text_input_widget(self, widget):
+        """判断当前焦点是否在文本输入控件中。"""
+        try:
+            widget_class = widget.winfo_class()
+        except Exception:
+            return False
+
+        text_input_classes = {
+            'Entry',
+            'TEntry',
+            'Text',
+            'TCombobox',
+            'Spinbox',
+            'TSpinbox'
+        }
+        return widget_class in text_input_classes
+
+    def handle_quick_rotate_shortcut(self, event, angle_delta):
+        """处理Q/E旋转快捷键，避免输入文字时误触发。"""
+        if self.is_text_input_widget(getattr(event, 'widget', None)):
+            return None
+
+        self.quick_rotate(angle_delta)
+        return "break"
     
     def quick_rotate(self, angle_delta):
         """快捷旋转选中的对象
@@ -2888,11 +3420,21 @@ QQ：1248360754 小红书：5615193523"""
         
         # 计算不可见区域宽度（所有情况下都需要）
         invisible_width = self.stage_width / 8  # 左右备台区域宽度为舞台宽度的1/8
+        locked_rect_view = self.rect_selecting and self.rect_select_view_range is not None
+        locked_background_view = self.background_dragging and self.background_drag_view_range is not None
         
         # 如果正在播放且有固定视图范围，使用固定范围
         min_y = 0
 
-        if self.is_playing and self.fixed_view_range:
+        if locked_background_view or locked_rect_view:
+            view_range = self.background_drag_view_range if locked_background_view else self.rect_select_view_range
+            xlim = view_range['xlim']
+            ylim = view_range['ylim']
+            self.ax.set_xlim(xlim)
+            self.ax.set_ylim(ylim)
+            min_y = float(ylim[0])
+            self.ax.set_aspect('equal', adjustable='box')
+        elif self.is_playing and self.fixed_view_range:
             xlim = self.fixed_view_range['xlim']
             ylim = self.fixed_view_range['ylim']
             # 直接使用捕获的固定范围，不要再次应用缩放
@@ -2955,7 +3497,8 @@ QQ：1248360754 小红书：5615193523"""
         
         # 设置固定的长宽比，确保舞台和对象不会变形
         # 使用 'datalim' 让坐标轴可以调整大小，同时保持数据的长宽比
-        self.ax.set_aspect('equal', adjustable='datalim')
+        locked_view = locked_background_view or locked_rect_view
+        self.ax.set_aspect('equal', adjustable='box' if locked_view else 'datalim')
         
         # 设置坐标轴刻度，与辅助线间隔对应
         if self.grid_enabled.get() and self.grid_interval_x >= 0.1 and self.grid_interval_y >= 0.1:
@@ -3019,6 +3562,12 @@ QQ：1248360754 小红书：5615193523"""
             self.ax.grid(False)
         
         
+        self.draw_stage_background(
+            self.ax,
+            show_controls=self.stage_background_adjust_enabled.get()
+        )
+        self.ax.set_aspect('equal', adjustable='box' if locked_view else 'datalim')
+
         # 绘制舞台边界
         stage_rect = Rectangle((-self.stage_width/2, 0), self.stage_width, self.stage_height, 
                              fill=False, color='black', linewidth=2)
@@ -3139,6 +3688,8 @@ QQ：1248360754 小红书：5615193523"""
                                    zorder=0)
                         y_line_count += 1
                     y -= self.grid_interval_y
+
+            self.draw_custom_guides(self.ax, xlim=(x_start, x_end), ylim=(y_start, y_end), with_labels=True)
         
         # 绘制所有演员
         for actor in self.actors:
@@ -4147,6 +4698,131 @@ QQ：1248360754 小红书：5615193523"""
         self.grid_color = color_map.get(self.grid_color_var.get(), 'black')
         self.update_stage_preview()
         self.log(f"✓ 辅助线颜色已更新", 'success')
+
+    def normalize_custom_guides(self, guides):
+        """整理自定义辅助线数据，兼容旧项目和异常值。"""
+        normalized = []
+        if not isinstance(guides, list):
+            return normalized
+
+        for guide in guides:
+            if not isinstance(guide, dict):
+                continue
+            axis = guide.get('axis')
+            if axis not in ('x', 'y'):
+                continue
+            try:
+                value = float(guide.get('value'))
+            except (TypeError, ValueError):
+                continue
+            normalized.append({'axis': axis, 'value': value})
+
+        return normalized
+
+    def format_custom_guide(self, guide):
+        """生成自定义辅助线列表显示文本。"""
+        axis_label = "竖线 X" if guide.get('axis') == 'x' else "横线 Y"
+        return f"{axis_label} = {guide.get('value', 0):.2f}"
+
+    def refresh_custom_guides_list(self):
+        """刷新自定义辅助线列表。"""
+        if not hasattr(self, 'custom_guides_listbox'):
+            return
+
+        self.custom_guides_listbox.delete(0, tk.END)
+        for guide in self.custom_guides:
+            self.custom_guides_listbox.insert(tk.END, self.format_custom_guide(guide))
+
+    def add_custom_guide(self):
+        """添加一条指定坐标的辅助线。"""
+        try:
+            value = float(self.custom_guide_value_entry.get())
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的辅助线坐标")
+            return
+
+        axis = 'x' if self.custom_guide_axis_var.get() == "竖线X" else 'y'
+        for guide in self.custom_guides:
+            if guide['axis'] == axis and abs(guide['value'] - value) < 0.0001:
+                self.log("⚠️ 这条自定义辅助线已经存在", 'warning')
+                return
+
+        self.save_state_to_history("添加自定义辅助线")
+        self.custom_guides.append({'axis': axis, 'value': value})
+        self.custom_guides.sort(key=lambda item: (item['axis'], item['value']))
+        self.custom_guide_value_entry.delete(0, tk.END)
+        self.refresh_custom_guides_list()
+        self.update_stage_preview()
+        self.log(f"✓ 已添加自定义辅助线: {self.format_custom_guide({'axis': axis, 'value': value})}", 'success')
+
+    def delete_selected_custom_guide(self):
+        """删除列表中选中的自定义辅助线。"""
+        if not hasattr(self, 'custom_guides_listbox'):
+            return
+
+        selection = self.custom_guides_listbox.curselection()
+        if not selection:
+            self.log("⚠️ 请先选中要删除的自定义辅助线", 'warning')
+            return
+
+        index = selection[0]
+        if index >= len(self.custom_guides):
+            return
+
+        removed = self.custom_guides[index]
+        self.save_state_to_history("删除自定义辅助线")
+        del self.custom_guides[index]
+        self.refresh_custom_guides_list()
+        self.update_stage_preview()
+        self.log(f"✓ 已删除自定义辅助线: {self.format_custom_guide(removed)}", 'success')
+
+    def clear_custom_guides(self):
+        """清空所有自定义辅助线。"""
+        if not self.custom_guides:
+            return
+
+        self.save_state_to_history("清空自定义辅助线")
+        self.custom_guides.clear()
+        self.refresh_custom_guides_list()
+        self.update_stage_preview()
+        self.log("✓ 已清空自定义辅助线", 'success')
+
+    def draw_custom_guides(self, ax, xlim=None, ylim=None, with_labels=True):
+        """绘制用户指定坐标的辅助线。"""
+        if not self.custom_guides:
+            return
+
+        if xlim is None:
+            xlim = ax.get_xlim()
+        if ylim is None:
+            ylim = ax.get_ylim()
+
+        guide_color = '#0088cc'
+        for guide in self.custom_guides:
+            axis = guide.get('axis')
+            value = guide.get('value')
+            if axis == 'x':
+                if value < xlim[0] or value > xlim[1]:
+                    continue
+                ax.plot([value, value], [ylim[0], ylim[1]],
+                        color=guide_color, linestyle='-', linewidth=1.0,
+                        alpha=0.85, zorder=2)
+                if with_labels:
+                    ax.text(value, ylim[1], f"X={value:.2f}",
+                            ha='center', va='top', fontsize=8, color=guide_color,
+                            bbox=dict(facecolor='white', alpha=0.65, edgecolor='none', pad=1),
+                            zorder=3)
+            elif axis == 'y':
+                if value < ylim[0] or value > ylim[1]:
+                    continue
+                ax.plot([xlim[0], xlim[1]], [value, value],
+                        color=guide_color, linestyle='-', linewidth=1.0,
+                        alpha=0.85, zorder=2)
+                if with_labels:
+                    ax.text(xlim[0], value, f"Y={value:.2f}",
+                            ha='left', va='center', fontsize=8, color=guide_color,
+                            bbox=dict(facecolor='white', alpha=0.65, edgecolor='none', pad=1),
+                            zorder=3)
 
     def add_actor(self):
         """添加演员"""
@@ -5588,6 +6264,32 @@ QQ：1248360754 小红书：5615193523"""
                 self.view_center = ((xlim[0] + xlim[1]) / 2, (ylim[0] + ylim[1]) / 2)
             print(f"🖐️ 开始平移视图，起始位置: ({x:.2f}, {y:.2f})")
             return  # 平移模式下不处理对象拖动
+
+        # 背景图片控制点：拖拽边框/角点可调整大小和比例
+        if (event.button == 1 and
+                self.stage_background_image is not None and
+                self.stage_background_adjust_enabled.get()):
+            background_handle = self.get_stage_background_hit_handle(x, y)
+            if not background_handle and self.is_point_in_stage_background(x, y):
+                background_handle = "move"
+            if background_handle:
+                import copy
+                operation_name = "移动舞台背景图片" if background_handle == "move" else "调整舞台背景图片"
+                self.save_state_to_history(operation_name)
+                self.background_dragging = True
+                self.background_drag_handle = background_handle
+                self.background_drag_start = (x, y)
+                self.background_drag_start_bounds = copy.deepcopy(self.get_stage_background_bounds())
+                self.background_ratio_resize_axis = None
+                self.background_keep_ratio_active = False
+                self.background_drag_view_range = {
+                    'xlim': self.ax.get_xlim(),
+                    'ylim': self.ax.get_ylim()
+                }
+                self.background_drag_pixel_bounds = self.ax.bbox.bounds
+                self.pending_deselect_item = None
+                print(f"🖼️ 开始{operation_name}: {background_handle}")
+                return
         
         # 检测是否按住Ctrl键（多选模式）
         ctrl_pressed = event.key == 'control' if hasattr(event, 'key') and event.key else False
@@ -5745,6 +6447,7 @@ QQ：1248360754 小红书：5615193523"""
                 for selected in self.selected_items:
                     current_pos = self.get_item_current_position(selected['item'])
                     selected['start_pos'] = current_pos
+                    selected['start_keyframes'] = list(selected['item'].get("keyframes", []))
                 
                 self.dragging = True
                 self.drag_item = clicked_item  # 保持兼容性
@@ -5754,6 +6457,11 @@ QQ：1248360754 小红书：5615193523"""
                 self.drag_start_pos = pos
                 self.drag_end_pos = pos  # 初始化为相同位置，只有真正移动时才会改变
                 self.multi_select_start_mouse_pos = (x, y)
+                self.drag_start_mouse_pos = (x, y)
+                self.drag_last_mouse_pos = (x, y)
+                self.drag_start_pixel_pos = (event.x, event.y)
+                self.drag_last_pixel_pos = (event.x, event.y)
+                self.drag_selection_count = len(self.selected_items)
                 
                 # 更新列表框选择
                 if not ctrl_pressed:
@@ -5798,6 +6506,11 @@ QQ：1248360754 小红书：5615193523"""
                 self.rect_selecting = True
                 self.rect_select_start = (x, y)
                 self.rect_select_end = (x, y)
+                self.rect_select_view_range = {
+                    'xlim': self.ax.get_xlim(),
+                    'ylim': self.ax.get_ylim()
+                }
+                self.rect_select_pixel_bounds = self.ax.bbox.bounds
                 print(f"🔲 开始矩形框选，起点: ({x:.2f}, {y:.2f})")
             else:
                 # 非Ctrl模式下，清空所有选择
@@ -5816,12 +6529,26 @@ QQ：1248360754 小红书：5615193523"""
         # 记录鼠标位置（用于粘贴功能）
         if event.inaxes == self.ax and event.xdata is not None and event.ydata is not None:
             self.last_mouse_pos = (event.xdata, event.ydata)
+
+        # 处理背景图片缩放
+        if self.background_dragging:
+            coords = self.get_background_drag_data_coords(event)
+            if coords is not None:
+                x, y = coords
+                if self.background_drag_handle == "move":
+                    self.move_stage_background(x, y)
+                else:
+                    keep_ratio = self.is_shift_pressed(event)
+                    self.resize_stage_background(x, y, keep_ratio=keep_ratio)
+                self.update_stage_preview()
+            return
         
         # 处理矩形框选
         if self.rect_selecting:
-            if event.inaxes == self.ax and event.xdata is not None and event.ydata is not None:
+            coords = self.get_rect_select_data_coords(event)
+            if coords is not None:
                 # 更新矩形框的结束点
-                self.rect_select_end = (event.xdata, event.ydata)
+                self.rect_select_end = coords
                 # 刷新显示以绘制矩形框
                 self.update_stage_preview()
             return
@@ -5859,23 +6586,26 @@ QQ：1248360754 小红书：5615193523"""
         if event.inaxes == self.ax and event.xdata is not None and event.ydata is not None:
             x = event.xdata
             y = event.ydata
+            self.drag_last_mouse_pos = (x, y)
+            self.drag_last_pixel_pos = (event.x, event.y)
         else:
             # 鼠标在画布外，暂停拖动更新但保持拖动状态
             # 这样当鼠标移回画布时可以继续拖动
             return
         
-        # 计算从起始位置移动的距离
-        if self.drag_start_pos:
-            move_distance = ((x - self.drag_start_pos[0])**2 + (y - self.drag_start_pos[1])**2)**0.5
+        # 计算从起始位置移动的屏幕像素距离；用像素判断抖动，避免挡住舞台坐标里的小幅微调。
+        if self.drag_start_pixel_pos and self.drag_last_pixel_pos:
+            move_distance = ((self.drag_last_pixel_pos[0] - self.drag_start_pixel_pos[0])**2 +
+                             (self.drag_last_pixel_pos[1] - self.drag_start_pixel_pos[1])**2)**0.5
         else:
             move_distance = 0
         
         # 如果是第一次拖动（还未保存过历史），保存历史记录
         # 只有当移动距离超过阈值时才认为是真正的拖动
-        if (not hasattr(self, '_drag_history_saved') or not self._drag_history_saved) and move_distance >= 0.5:
+        if (not hasattr(self, '_drag_history_saved') or not self._drag_history_saved) and move_distance >= self.drag_jitter_pixel_threshold:
             # 如果有待取消标志，说明用户选择了拖动而不是取消，清除标志
             if self.pending_deselect_item is not None:
-                print(f"🔄 拖动距离 {move_distance:.3f} ≥ 0.5，清除待取消标志")
+                print(f"🔄 拖动距离 {move_distance:.1f}px ≥ {self.drag_jitter_pixel_threshold:.1f}px，清除待取消标志")
                 self.pending_deselect_item = None
             
             if len(self.selected_items) > 1:
@@ -5962,11 +6692,106 @@ QQ：1248360754 小红书：5615193523"""
         
         # 更新显示
         self.update_stage_preview()
+
+    def restore_cancelled_drag_positions(self):
+        """鼠标轻微抖动不算拖动，恢复被临时写入的位置。"""
+        if self.selected_items:
+            for selected in self.selected_items:
+                item = selected.get('item')
+                if not item or "positions" not in item:
+                    continue
+
+                start_pos = selected.get('start_pos')
+                if start_pos is not None and self.current_frame < len(item["positions"]):
+                    item["positions"][self.current_frame] = start_pos
+
+                if 'start_keyframes' in selected:
+                    item["keyframes"] = list(selected["start_keyframes"])
+        elif self.drag_item and self.drag_start_pos and "positions" in self.drag_item:
+            if self.current_frame < len(self.drag_item["positions"]):
+                self.drag_item["positions"][self.current_frame] = self.drag_start_pos
+
+    def reset_drag_state(self):
+        """清理对象拖动状态。"""
+        self.dragging = False
+        self.drag_item = None
+        self.drag_type = None
+        self.drag_index = None
+        self.drag_start_pos = None
+        self.drag_end_pos = None
+        self.multi_select_start_mouse_pos = None
+        self.drag_selection_count = 0
+        self.drag_start_mouse_pos = None
+        self.drag_last_mouse_pos = None
+        self.drag_start_pixel_pos = None
+        self.drag_last_pixel_pos = None
+        self._drag_history_saved = False
+        self.align_guides.clear()
+
+    def get_background_drag_data_coords(self, event):
+        """用背景拖动开始时固定的像素映射换算坐标，避免重绘造成缩放跳动。"""
+        if not self.background_drag_view_range or not self.background_drag_pixel_bounds:
+            if event.xdata is not None and event.ydata is not None:
+                return event.xdata, event.ydata
+            return None
+
+        x0, y0, width, height = self.background_drag_pixel_bounds
+        if width <= 0 or height <= 0:
+            return None
+
+        xlim = self.background_drag_view_range['xlim']
+        ylim = self.background_drag_view_range['ylim']
+        px = min(max(event.x, x0), x0 + width)
+        py = min(max(event.y, y0), y0 + height)
+        x_ratio = (px - x0) / width
+        y_ratio = (py - y0) / height
+        data_x = xlim[0] + x_ratio * (xlim[1] - xlim[0])
+        data_y = ylim[0] + y_ratio * (ylim[1] - ylim[0])
+        return data_x, data_y
+
+    def get_rect_select_data_coords(self, event):
+        """用框选开始时固定的像素映射换算数据坐标，避免重绘导致跳动。"""
+        if not self.rect_select_view_range or not self.rect_select_pixel_bounds:
+            if event.xdata is not None and event.ydata is not None:
+                return event.xdata, event.ydata
+            return None
+
+        x0, y0, width, height = self.rect_select_pixel_bounds
+        if width <= 0 or height <= 0:
+            return None
+
+        xlim = self.rect_select_view_range['xlim']
+        ylim = self.rect_select_view_range['ylim']
+
+        px = min(max(event.x, x0), x0 + width)
+        py = min(max(event.y, y0), y0 + height)
+
+        x_ratio = (px - x0) / width
+        y_ratio = (py - y0) / height
+        data_x = xlim[0] + x_ratio * (xlim[1] - xlim[0])
+        data_y = ylim[0] + y_ratio * (ylim[1] - ylim[0])
+        return data_x, data_y
         
     def on_mouse_release(self, event):
         """处理鼠标释放事件"""
+        if self.background_dragging:
+            self.background_dragging = False
+            self.background_drag_handle = None
+            self.background_drag_start = None
+            self.background_drag_start_bounds = None
+            self.background_ratio_resize_axis = None
+            self.background_keep_ratio_active = False
+            self.background_drag_view_range = None
+            self.background_drag_pixel_bounds = None
+            self.update_stage_preview()
+            self.log("✓ 舞台背景图片已调整", 'success')
+            return
+
         # 结束矩形框选
         if self.rect_selecting:
+            coords = self.get_rect_select_data_coords(event)
+            if coords is not None:
+                self.rect_select_end = coords
             self.rect_selecting = False
             
             if self.rect_select_start and self.rect_select_end:
@@ -6052,6 +6877,8 @@ QQ：1248360754 小红书：5615193523"""
             # 清除框选状态
             self.rect_select_start = None
             self.rect_select_end = None
+            self.rect_select_view_range = None
+            self.rect_select_pixel_bounds = None
             
             # 刷新显示
             self.update_stage_preview()
@@ -6130,21 +6957,25 @@ QQ：1248360754 小红书：5615193523"""
             self.drag_end_pos = (x, y)
             print(f"元素在预览区域外释放，限制到边缘位置: ({x:.2f}, {y:.2f})")
             
-        # 计算拖动距离
-        if self.drag_start_pos and self.drag_end_pos:
-            drag_distance = ((self.drag_end_pos[0] - self.drag_start_pos[0])**2 + 
-                           (self.drag_end_pos[1] - self.drag_start_pos[1])**2)**0.5
+        if hasattr(event, 'x') and hasattr(event, 'y') and self.drag_start_pixel_pos:
+            self.drag_last_pixel_pos = (event.x, event.y)
+
+        # 计算拖动距离。这里用屏幕像素判断是否为抖动，避免舞台坐标阈值过宽导致小范围移动被取消。
+        if self.drag_start_pixel_pos and self.drag_last_pixel_pos:
+            drag_distance = ((self.drag_last_pixel_pos[0] - self.drag_start_pixel_pos[0])**2 +
+                           (self.drag_last_pixel_pos[1] - self.drag_start_pixel_pos[1])**2)**0.5
         else:
             drag_distance = 0
         
         # 增加调试信息 - 显示拖动距离
-        print(f"📏 拖动距离: {drag_distance:.3f} (阈值: 0.5)")
+        print(f"📏 拖动距离: {drag_distance:.1f}px (阈值: {self.drag_jitter_pixel_threshold:.1f}px)")
         if self.pending_deselect_item is not None:
             print(f"   待取消对象: {self.pending_deselect_item['name']}")
         
-        # 如果位置没有变化或移动距离很小（< 0.5，视为点击而非拖动）
-        # 提高阈值到 0.5 以减少鼠标轻微抖动造成的误判
-        if drag_distance < 0.5:
+        # 如果像素移动很小，视为点击而非拖动。
+        if drag_distance < self.drag_jitter_pixel_threshold:
+            self.restore_cancelled_drag_positions()
+
             # 先处理待取消选中的对象（Ctrl+点击已选中对象但未拖动）
             pending_deselect_handled = False
             if self.pending_deselect_item is not None:
@@ -6176,6 +7007,7 @@ QQ：1248360754 小红书：5615193523"""
             
             # 处理重叠对象的循环选择：只有在没有处理 pending_deselect 时才循环切换
             if (not pending_deselect_handled and
+                self.drag_selection_count <= 1 and
                 len(self.overlap_candidates) > 1 and 
                 self.last_click_pos is not None and 
                 event.xdata is not None and event.ydata is not None):
@@ -6235,13 +7067,8 @@ QQ：1248360754 小红书：5615193523"""
                     self.log(f"🔄 切换选中: {new_item['name']} ({self.overlap_current_index + 1}/{len(self.overlap_candidates)})", 'info')
             
             # 重置拖动状态
-            self.dragging = False
-            self.drag_item = None
-            self.drag_type = None
-            self.drag_index = None
-            self.drag_start_pos = None
-            self.drag_end_pos = None
-            self._drag_history_saved = False  # 重置拖动历史保存标志
+            self.reset_drag_state()
+            self.update_stage_preview()
             return
             
         # 保存最后拖动的项目和位置
@@ -6270,21 +7097,11 @@ QQ：1248360754 小红书：5615193523"""
         
         # 如果有待取消标志但发生了拖动，清除标志（用户是想拖动）
         if self.pending_deselect_item is not None:
-            print(f"🔄 发生了拖动(距离≥0.5)，取消待取消操作: {self.pending_deselect_item['name']}")
+            print(f"🔄 发生了拖动(距离≥{self.drag_jitter_pixel_threshold:.1f}px)，取消待取消操作: {self.pending_deselect_item['name']}")
             self.pending_deselect_item = None
         
         # 重置拖动状态
-        self.dragging = False
-        self.drag_item = None
-        self.drag_type = None
-        self.drag_index = None
-        self.drag_start_pos = None
-        self.drag_end_pos = None
-        self.multi_select_start_mouse_pos = None
-        self._drag_history_saved = False  # 重置拖动历史保存标志
-        
-        # 清空对齐辅助线
-        self.align_guides.clear()
+        self.reset_drag_state()
         
         # 不清空 selected_items，保持选中状态以便继续操作
     
@@ -6700,16 +7517,24 @@ QQ：1248360754 小红书：5615193523"""
         snapped_y = new_y
         guides = []
         
-        # 收集所有其他对象（不包括正在拖动的对象）
+        # 收集所有其他对象（不包括正在拖动的对象，多选时也排除整组选中对象）
+        excluded_ids = {id(obj)}
+        if len(self.selected_items) > 1:
+            excluded_ids.update(id(selected['item']) for selected in self.selected_items)
+
         other_objects = []
         for actor in self.actors:
-            if actor is not obj:
+            if id(actor) not in excluded_ids:
                 pos = self.get_item_current_position(actor)
                 other_objects.append(('actor', actor, pos))
         for prop in self.props:
-            if prop is not obj:
+            if id(prop) not in excluded_ids:
                 pos = self.get_item_current_position(prop)
                 other_objects.append(('prop', prop, pos))
+        for textbox in self.textboxes:
+            if id(textbox) not in excluded_ids:
+                pos = self.get_item_current_position(textbox)
+                other_objects.append(('textbox', textbox, pos))
         
         # 检测X方向的吸附
         min_x_dist = float('inf')
@@ -6738,6 +7563,24 @@ QQ：1248360754 小红书：5615193523"""
                 snap_y = other_pos[1]
                 # 绘制水平辅助线
                 y_guide = (-self.stage_width, other_pos[1], self.stage_width, other_pos[1], 'horizontal')
+
+        # 检测以舞台中心线为轴的左右镜像吸附：
+        # 拖动物体接近另一侧同水平元素的镜像点时，直接吸附到对称位置。
+        best_symmetry = None
+        best_symmetry_score = float('inf')
+        for obj_type, other_obj, other_pos in other_objects:
+            other_x, other_y = other_pos
+            if abs(other_x) < 0.0001:
+                continue
+
+            mirror_x = -other_x
+            x_dist = abs(new_x - mirror_x)
+            y_dist = abs(new_y - other_y)
+            if x_dist < self.snap_threshold and y_dist < self.snap_threshold:
+                score = (x_dist ** 2 + y_dist ** 2) ** 0.5
+                if score < best_symmetry_score:
+                    best_symmetry_score = score
+                    best_symmetry = (mirror_x, other_y, other_x)
         
         # 应用吸附
         if snap_x is not None:
@@ -6749,6 +7592,17 @@ QQ：1248360754 小红书：5615193523"""
             snapped_y = snap_y
             if y_guide:
                 guides.append(y_guide)
+
+        if best_symmetry is not None:
+            mirror_x, mirror_y, source_x = best_symmetry
+            snapped_x = mirror_x
+            snapped_y = mirror_y
+            y_line_start = min(source_x, mirror_x)
+            y_line_end = max(source_x, mirror_x)
+            guides = [
+                (y_line_start, mirror_y, y_line_end, mirror_y, 'horizontal'),
+                (0, -10, 0, self.stage_height + 10, 'vertical')
+            ]
         
         return snapped_x, snapped_y, guides
     
@@ -7978,7 +8832,10 @@ QQ：1248360754 小红书：5615193523"""
                 "actors": self.actors,
                 "props": self.props,
                 "text_box": self.text_box,
-                "textboxes": self.textboxes  # 新版文本框系统
+                "textboxes": self.textboxes,  # 新版文本框系统
+                "stage_background_path": self.stage_background_path,
+                "stage_background_bounds": self.stage_background_bounds,
+                "custom_guides": self.custom_guides
             }
             
             # 保存到文件
@@ -8022,6 +8879,24 @@ QQ：1248360754 小红书：5615193523"""
             self.width_entry.insert(0, str(self.stage_width))
             self.height_entry.delete(0, tk.END)
             self.height_entry.insert(0, str(self.stage_height))
+
+            self.stage_background_path = project_data.get("stage_background_path")
+            if self.stage_background_path:
+                if not self.load_stage_background_image(self.stage_background_path, show_errors=False):
+                    self.log("⚠️ 项目里的舞台背景图片未找到，已跳过背景", 'warning')
+                    self.stage_background_path = None
+                    self.stage_background_bounds = None
+                else:
+                    self.stage_background_bounds = project_data.get("stage_background_bounds")
+                    if not self.stage_background_bounds:
+                        self.stage_background_bounds = self.get_default_stage_background_bounds()
+            else:
+                self.load_stage_background_image(None, show_errors=False)
+                self.stage_background_bounds = None
+            if hasattr(self, 'remove_background_btn'):
+                self.remove_background_btn.config(state='normal' if self.stage_background_path else 'disabled')
+            self.custom_guides = self.normalize_custom_guides(project_data.get("custom_guides", []))
+            self.refresh_custom_guides_list()
             
             # 更新总帧数（兼容旧版本项目文件）
             saved_fps = project_data.get("fps", self.fps)
@@ -8293,6 +9168,441 @@ QQ：1248360754 小红书：5615193523"""
             self.width_entry.insert(0, str(self.stage_width))
             self.height_entry.delete(0, tk.END)
             self.height_entry.insert(0, str(self.stage_height))
+
+    def open_insert_time_dialog(self):
+        """打开插入时间设置窗口。"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("插入时间")
+        dialog.geometry("360x190")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text=f"插入位置: {self.current_second:.2f} 秒").grid(
+            row=0, column=0, columnspan=2, sticky='w', padx=16, pady=(16, 8)
+        )
+
+        ttk.Label(dialog, text="插入时长(秒):").grid(row=1, column=0, sticky='e', padx=8, pady=6)
+        duration_entry = ttk.Entry(dialog, width=12)
+        duration_entry.insert(0, "1.0")
+        duration_entry.grid(row=1, column=1, sticky='w', padx=8, pady=6)
+
+        ttk.Label(dialog, text="处理方式:").grid(row=2, column=0, sticky='e', padx=8, pady=6)
+        mode_var = tk.StringVar(value="停顿保持")
+        mode_combo = ttk.Combobox(
+            dialog,
+            textvariable=mode_var,
+            values=["停顿保持", "重算速度"],
+            state="readonly",
+            width=14
+        )
+        mode_combo.grid(row=2, column=1, sticky='w', padx=8, pady=6)
+
+        hint = ttk.Label(dialog, text="停顿保持会冻结当前状态；重算速度会后移后续关键帧。", foreground='gray')
+        hint.grid(row=3, column=0, columnspan=2, sticky='w', padx=16, pady=(4, 10))
+
+        button_row = ttk.Frame(dialog)
+        button_row.grid(row=4, column=0, columnspan=2, pady=8)
+
+        def confirm():
+            try:
+                duration_seconds = float(duration_entry.get())
+                if duration_seconds <= 0:
+                    raise ValueError("插入时长必须大于0")
+
+                mode = "freeze" if mode_var.get() == "停顿保持" else "speed"
+                self.insert_time_at_current(duration_seconds, mode)
+                dialog.destroy()
+            except ValueError as e:
+                messagebox.showerror("错误", str(e))
+
+        ttk.Button(button_row, text="确定", command=confirm, width=10).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_row, text="取消", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=6)
+
+        duration_entry.focus()
+        duration_entry.select_range(0, tk.END)
+        dialog.bind('<Return>', lambda e: confirm())
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+
+    def copy_frame_value(self, value):
+        import copy
+        return copy.deepcopy(value)
+
+    def get_array_value_at_frame(self, values, frame, default=None):
+        if values and 0 <= frame < len(values):
+            return self.copy_frame_value(values[frame])
+        if values:
+            return self.copy_frame_value(values[-1])
+        return self.copy_frame_value(default)
+
+    def insert_repeated_frames(self, values, insert_frame, insert_frames, fill_value):
+        insert_index = min(max(insert_frame + 1, 0), len(values))
+        repeated = [self.copy_frame_value(fill_value) for _ in range(insert_frames)]
+        return values[:insert_index] + repeated + values[insert_index:]
+
+    def shift_frames_after_insert(self, frames, insert_frame, insert_frames):
+        shifted = []
+        for frame in frames:
+            frame = int(frame)
+            shifted.append(frame + insert_frames if frame > insert_frame else frame)
+        return sorted(set(shifted))
+
+    def add_unique_frame(self, frames, frame):
+        frame = int(frame)
+        if frame not in frames:
+            frames.append(frame)
+        frames.sort()
+
+    def update_text_duration_for_insert(self, textbox, insert_frame, insert_frames):
+        start_frame = int(textbox.get("start_frame", 0))
+        duration_frames = int(textbox.get("duration_frames", self.total_frames))
+        end_frame = start_frame + duration_frames
+
+        if start_frame > insert_frame:
+            textbox["start_frame"] = start_frame + insert_frames
+        elif start_frame <= insert_frame < end_frame:
+            textbox["duration_frames"] = duration_frames + insert_frames
+
+    def insert_frames_into_motion_item(self, item, insert_frame, insert_frames, mode):
+        old_total_frames = self.total_frames - insert_frames
+        safe_frame = min(insert_frame, max(0, old_total_frames - 1))
+
+        if "positions" in item:
+            current_pos = self.get_item_current_position(item)
+            item["positions"] = self.insert_repeated_frames(item["positions"], insert_frame, insert_frames, current_pos)
+            if safe_frame < len(item["positions"]):
+                item["positions"][safe_frame] = current_pos
+
+            item["keyframes"] = self.shift_frames_after_insert(item.get("keyframes", []), insert_frame, insert_frames)
+            if mode == "freeze" and item["keyframes"]:
+                self.add_unique_frame(item["keyframes"], insert_frame)
+                self.add_unique_frame(item["keyframes"], insert_frame + insert_frames)
+                item["positions"][insert_frame] = current_pos
+                item["positions"][insert_frame + insert_frames] = current_pos
+            elif mode == "speed" and item["keyframes"]:
+                self.add_unique_frame(item["keyframes"], insert_frame)
+                item["positions"][insert_frame] = current_pos
+
+        if "rotations" in item:
+            current_rotation = self.get_array_value_at_frame(item["rotations"], safe_frame, 0.0)
+            item["rotations"] = self.insert_repeated_frames(item["rotations"], insert_frame, insert_frames, current_rotation)
+            item["rotation_keyframes"] = self.shift_frames_after_insert(item.get("rotation_keyframes", []), insert_frame, insert_frames)
+            if mode == "freeze" and item["rotation_keyframes"]:
+                self.add_unique_frame(item["rotation_keyframes"], insert_frame)
+                self.add_unique_frame(item["rotation_keyframes"], insert_frame + insert_frames)
+                item["rotations"][insert_frame] = current_rotation
+                item["rotations"][insert_frame + insert_frames] = current_rotation
+            elif mode == "speed" and item["rotation_keyframes"]:
+                self.add_unique_frame(item["rotation_keyframes"], insert_frame)
+                item["rotations"][insert_frame] = current_rotation
+
+        if "styles_per_frame" in item:
+            current_style = self.get_array_value_at_frame(item["styles_per_frame"], safe_frame, {})
+            item["styles_per_frame"] = self.insert_repeated_frames(item["styles_per_frame"], insert_frame, insert_frames, current_style)
+            if "style_keyframes" in item:
+                item["style_keyframes"] = self.shift_frames_after_insert(item["style_keyframes"], insert_frame, insert_frames)
+
+        if "name_char_styles_per_frame" in item:
+            current_name_style = self.get_array_value_at_frame(item["name_char_styles_per_frame"], safe_frame, [])
+            item["name_char_styles_per_frame"] = self.insert_repeated_frames(
+                item["name_char_styles_per_frame"], insert_frame, insert_frames, current_name_style
+            )
+
+        if item.get("keyframes"):
+            self.update_intermediate_frames(item)
+        if item.get("rotation_keyframes"):
+            self.update_intermediate_rotations(item)
+
+    def insert_frames_into_textbox(self, textbox, insert_frame, insert_frames, mode):
+        self.insert_frames_into_motion_item(textbox, insert_frame, insert_frames, mode)
+
+        old_total_frames = self.total_frames - insert_frames
+        safe_frame = min(insert_frame, max(0, old_total_frames - 1))
+
+        if "contents" in textbox:
+            current_content = self.get_array_value_at_frame(textbox["contents"], safe_frame, "")
+            textbox["contents"] = self.insert_repeated_frames(textbox["contents"], insert_frame, insert_frames, current_content)
+
+        if "char_styles_per_frame" in textbox:
+            current_char_style = self.get_array_value_at_frame(textbox["char_styles_per_frame"], safe_frame, [])
+            textbox["char_styles_per_frame"] = self.insert_repeated_frames(
+                textbox["char_styles_per_frame"], insert_frame, insert_frames, current_char_style
+            )
+
+        self.update_text_duration_for_insert(textbox, insert_frame, insert_frames)
+
+    def insert_frames_into_legacy_textbox(self, insert_frame, insert_frames):
+        old_contents = self.text_box.get("contents", [])
+        current_content = self.get_array_value_at_frame(old_contents, insert_frame, "")
+        self.text_box["contents"] = self.insert_repeated_frames(old_contents, insert_frame, insert_frames, current_content)
+
+        old_durations = self.text_box.get("durations", {})
+        new_durations = {}
+        for start_frame, duration_frames in old_durations.items():
+            start_frame = int(start_frame)
+            duration_frames = int(duration_frames)
+            end_frame = start_frame + duration_frames
+            if start_frame > insert_frame:
+                start_frame += insert_frames
+            elif start_frame <= insert_frame < end_frame:
+                duration_frames += insert_frames
+            new_durations[start_frame] = duration_frames
+        self.text_box["durations"] = new_durations
+
+    def insert_time_at_current(self, duration_seconds, mode):
+        """在当前时间点插入一段时间。"""
+        if hasattr(self, 'animation_loop') and self.animation_loop.running:
+            messagebox.showwarning("警告", "请先停止播放再插入时间")
+            return
+
+        insert_frames = max(1, int(round(duration_seconds * self.fps)))
+        insert_frame = max(0, min(self.current_frame, self.total_frames - 1))
+        mode_label = "停顿保持" if mode == "freeze" else "重算速度"
+
+        self.save_state_to_history(f"插入时间 ({duration_seconds:.2f}秒, {mode_label})")
+
+        for item in self.actors + self.props + self.textboxes:
+            if item.get("keyframes"):
+                self.update_intermediate_frames(item)
+            if item.get("rotation_keyframes"):
+                self.update_intermediate_rotations(item)
+
+        old_total_frames = self.total_frames
+        self.total_frames += insert_frames
+        self.total_seconds = self.total_frames / self.fps
+
+        for actor in self.actors:
+            self.insert_frames_into_motion_item(actor, insert_frame, insert_frames, mode)
+        for prop in self.props:
+            self.insert_frames_into_motion_item(prop, insert_frame, insert_frames, mode)
+        for textbox in self.textboxes:
+            self.insert_frames_into_textbox(textbox, insert_frame, insert_frames, mode)
+
+        self.insert_frames_into_legacy_textbox(insert_frame, insert_frames)
+
+        self.current_frame = insert_frame
+        self.current_second = insert_frame / self.fps
+        self.time_scale.config(to=self.total_seconds)
+        self.time_scale.set(self.current_second)
+        self.seconds_entry.delete(0, tk.END)
+        self.seconds_entry.insert(0, f"{self.total_seconds:.2f}")
+
+        self.temp_position_overrides.clear()
+        self.temp_keyframes.clear()
+        self.on_keyframe_list_select(None)
+        if self.ruler_enabled.get():
+            self.update_custom_ruler()
+
+        self.update_stage_preview()
+        self.log(
+            f"✓ 已在 {insert_frame / self.fps:.2f}秒插入 {insert_frames / self.fps:.2f}秒（{mode_label}）",
+            'success'
+        )
+
+    def open_delete_time_dialog(self):
+        """打开删除时间段设置窗口。"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("删除时间")
+        dialog.geometry("360x175")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        default_start = self.current_second
+        default_end = min(self.total_seconds, self.current_second + 1.0)
+
+        ttk.Label(dialog, text="删除时间段").grid(
+            row=0, column=0, columnspan=2, sticky='w', padx=16, pady=(16, 8)
+        )
+
+        ttk.Label(dialog, text="开始时间(秒):").grid(row=1, column=0, sticky='e', padx=8, pady=6)
+        start_entry = ttk.Entry(dialog, width=12)
+        start_entry.insert(0, f"{default_start:.2f}")
+        start_entry.grid(row=1, column=1, sticky='w', padx=8, pady=6)
+
+        ttk.Label(dialog, text="结束时间(秒):").grid(row=2, column=0, sticky='e', padx=8, pady=6)
+        end_entry = ttk.Entry(dialog, width=12)
+        end_entry.insert(0, f"{default_end:.2f}")
+        end_entry.grid(row=2, column=1, sticky='w', padx=8, pady=6)
+
+        hint = ttk.Label(dialog, text="删除后会以前后关键帧重新计算插值。", foreground='gray')
+        hint.grid(row=3, column=0, columnspan=2, sticky='w', padx=16, pady=(4, 10))
+
+        button_row = ttk.Frame(dialog)
+        button_row.grid(row=4, column=0, columnspan=2, pady=8)
+
+        def confirm():
+            try:
+                start_seconds = float(start_entry.get())
+                end_seconds = float(end_entry.get())
+                self.delete_time_range(start_seconds, end_seconds)
+                dialog.destroy()
+            except ValueError as e:
+                messagebox.showerror("错误", str(e))
+
+        ttk.Button(button_row, text="确定", command=confirm, width=10).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_row, text="取消", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=6)
+
+        start_entry.focus()
+        start_entry.select_range(0, tk.END)
+        dialog.bind('<Return>', lambda e: confirm())
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+
+    def delete_frames_from_array(self, values, start_frame, end_frame):
+        return values[:start_frame] + values[end_frame:]
+
+    def shift_frames_after_delete(self, frames, start_frame, end_frame):
+        delete_frames = end_frame - start_frame
+        shifted = []
+        for frame in frames:
+            frame = int(frame)
+            if frame < start_frame:
+                shifted.append(frame)
+            elif frame >= end_frame:
+                shifted.append(frame - delete_frames)
+        return sorted(set(shifted))
+
+    def update_text_duration_for_delete(self, textbox, start_frame, end_frame):
+        delete_frames = end_frame - start_frame
+        text_start = int(textbox.get("start_frame", 0))
+        duration_frames = int(textbox.get("duration_frames", self.total_frames + delete_frames))
+        text_end = text_start + duration_frames
+
+        overlap = max(0, min(text_end, end_frame) - max(text_start, start_frame))
+
+        if text_start >= end_frame:
+            text_start -= delete_frames
+        elif text_start >= start_frame:
+            text_start = start_frame
+
+        textbox["start_frame"] = max(0, min(text_start, self.total_frames - 1))
+        textbox["duration_frames"] = max(0, duration_frames - overlap)
+
+    def delete_frames_from_motion_item(self, item, start_frame, end_frame):
+        if "positions" in item:
+            item["positions"] = self.delete_frames_from_array(item["positions"], start_frame, end_frame)
+            item["keyframes"] = self.shift_frames_after_delete(item.get("keyframes", []), start_frame, end_frame)
+
+        if "rotations" in item:
+            item["rotations"] = self.delete_frames_from_array(item["rotations"], start_frame, end_frame)
+            item["rotation_keyframes"] = self.shift_frames_after_delete(
+                item.get("rotation_keyframes", []), start_frame, end_frame
+            )
+
+        if "styles_per_frame" in item:
+            item["styles_per_frame"] = self.delete_frames_from_array(item["styles_per_frame"], start_frame, end_frame)
+            if "style_keyframes" in item:
+                item["style_keyframes"] = self.shift_frames_after_delete(item["style_keyframes"], start_frame, end_frame)
+
+        if "name_char_styles_per_frame" in item:
+            item["name_char_styles_per_frame"] = self.delete_frames_from_array(
+                item["name_char_styles_per_frame"], start_frame, end_frame
+            )
+
+        if item.get("keyframes"):
+            self.update_intermediate_frames(item)
+        if item.get("rotation_keyframes"):
+            self.update_intermediate_rotations(item)
+
+    def delete_frames_from_textbox(self, textbox, start_frame, end_frame):
+        self.delete_frames_from_motion_item(textbox, start_frame, end_frame)
+
+        if "contents" in textbox:
+            textbox["contents"] = self.delete_frames_from_array(textbox["contents"], start_frame, end_frame)
+
+        if "char_styles_per_frame" in textbox:
+            textbox["char_styles_per_frame"] = self.delete_frames_from_array(
+                textbox["char_styles_per_frame"], start_frame, end_frame
+            )
+
+        self.update_text_duration_for_delete(textbox, start_frame, end_frame)
+
+    def delete_frames_from_legacy_textbox(self, start_frame, end_frame):
+        if "contents" in self.text_box:
+            self.text_box["contents"] = self.delete_frames_from_array(self.text_box["contents"], start_frame, end_frame)
+
+        delete_frames = end_frame - start_frame
+        old_durations = self.text_box.get("durations", {})
+        new_durations = {}
+        for text_start, duration_frames in old_durations.items():
+            text_start = int(text_start)
+            duration_frames = int(duration_frames)
+            text_end = text_start + duration_frames
+            overlap = max(0, min(text_end, end_frame) - max(text_start, start_frame))
+
+            if text_start >= end_frame:
+                text_start -= delete_frames
+            elif text_start >= start_frame:
+                text_start = start_frame
+
+            new_duration = max(0, duration_frames - overlap)
+            if new_duration > 0:
+                new_durations[text_start] = new_duration
+        self.text_box["durations"] = new_durations
+
+    def delete_time_range(self, start_seconds, end_seconds):
+        """删除一段时间，并重新连接前后关键帧插值。"""
+        if hasattr(self, 'animation_loop') and self.animation_loop.running:
+            messagebox.showwarning("警告", "请先停止播放再删除时间")
+            return
+
+        if start_seconds < 0 or end_seconds > self.total_seconds:
+            raise ValueError(f"时间范围必须在0到{self.total_seconds:.2f}秒之间")
+        if end_seconds <= start_seconds:
+            raise ValueError("结束时间必须大于开始时间")
+
+        start_frame = max(0, min(int(round(start_seconds * self.fps)), self.total_frames - 1))
+        end_frame = max(start_frame + 1, min(int(round(end_seconds * self.fps)), self.total_frames))
+        delete_frames = end_frame - start_frame
+
+        if self.total_frames - delete_frames < 1:
+            raise ValueError("不能删除全部时间，至少需要保留一帧")
+
+        actual_start_seconds = start_frame / self.fps
+        actual_end_seconds = end_frame / self.fps
+        self.save_state_to_history(f"删除时间 ({actual_start_seconds:.2f}秒→{actual_end_seconds:.2f}秒)")
+
+        for item in self.actors + self.props + self.textboxes:
+            if item.get("keyframes"):
+                self.update_intermediate_frames(item)
+            if item.get("rotation_keyframes"):
+                self.update_intermediate_rotations(item)
+
+        self.total_frames -= delete_frames
+        self.total_seconds = self.total_frames / self.fps
+
+        for actor in self.actors:
+            self.delete_frames_from_motion_item(actor, start_frame, end_frame)
+        for prop in self.props:
+            self.delete_frames_from_motion_item(prop, start_frame, end_frame)
+        for textbox in self.textboxes:
+            self.delete_frames_from_textbox(textbox, start_frame, end_frame)
+
+        self.delete_frames_from_legacy_textbox(start_frame, end_frame)
+
+        if self.current_frame >= end_frame:
+            self.current_frame -= delete_frames
+        elif self.current_frame >= start_frame:
+            self.current_frame = start_frame
+        self.current_frame = max(0, min(self.current_frame, self.total_frames - 1))
+        self.current_second = self.current_frame / self.fps
+
+        self.time_scale.config(to=self.total_seconds)
+        self.time_scale.set(self.current_second)
+        self.seconds_entry.delete(0, tk.END)
+        self.seconds_entry.insert(0, f"{self.total_seconds:.2f}")
+
+        self.temp_position_overrides.clear()
+        self.temp_keyframes.clear()
+        self.on_keyframe_list_select(None)
+        if self.ruler_enabled.get():
+            self.update_custom_ruler()
+
+        self.update_stage_preview()
+        self.log(
+            f"✓ 已删除 {actual_start_seconds:.2f}秒 到 {actual_end_seconds:.2f}秒",
+            'success'
+        )
 
     def update_timeline_settings(self):
         """更新时间轴设置"""
@@ -8802,16 +10112,12 @@ QQ：1248360754 小红书：5615193523"""
             self.is_time_scale_updating = False
 
     def export_animation_with_audio(self):
-        """导出带音频的动画"""
+        """导出MP4动画；有音频时合成音频，没有音频时导出无声视频。"""
         # 检查动画是否正在播放
         if hasattr(self, 'animation_loop') and self.animation_loop.running:
             messagebox.showwarning("警告", "请先停止动画播放再进行导出")
             return
-            
-        if not self.audio_file:
-            messagebox.showwarning("警告", "请先导入音频文件")
-            return
-            
+
         try:
             # 获取导出帧率
             export_fps = int(self.export_fps_entry.get())
@@ -8831,7 +10137,7 @@ QQ：1248360754 小红书：5615193523"""
                 export_path = filedialog.asksaveasfilename(
                     defaultextension=".mp4",
                     initialdir=export_dir,
-                    initialfile="stage_animation_with_audio.mp4",
+                    initialfile="stage_animation_with_audio.mp4" if self.audio_file else "stage_animation.mp4",
                     filetypes=[("MP4 files", "*.mp4"), ("All files", "*.*")]
                 )
                 
@@ -8840,14 +10146,14 @@ QQ：1248360754 小红书：5615193523"""
                 
                 # 创建进度条窗口
                 progress_window = tk.Toplevel(self.root)
-                progress_window.title("MP4带音频导出进度")
+                progress_window.title("MP4导出进度")
                 progress_window.geometry("450x220")
                 progress_window.resizable(False, False)
                 progress_window.transient(self.root)
                 progress_window.grab_set()
-                
+
                 # 添加UI元素
-                main_label = ttk.Label(progress_window, text="正在导出带音频的MP4动画...", font=('Arial', 12, 'bold'))
+                main_label = ttk.Label(progress_window, text="正在导出MP4动画...", font=('Arial', 12, 'bold'))
                 main_label.pack(pady=15)
                 progress_bar = ttk.Progressbar(progress_window, length=400, mode='determinate')
                 progress_bar.pack(pady=10)
@@ -8860,7 +10166,7 @@ QQ：1248360754 小红书：5615193523"""
                 cancel_button = ttk.Button(progress_window, text="取消", 
                                          command=lambda: setattr(self, '_cancel_export', True))
                 cancel_button.pack(pady=10)
-                
+
                 # 初始化状态
                 self._cancel_export = False
                 start_time = time.time()
@@ -8868,7 +10174,8 @@ QQ：1248360754 小红书：5615193523"""
                 
                 # 显示项目信息
                 status_label.config(text=f"准备导出 {total_export_frames} 帧")
-                detail_label.config(text=f"帧率: {export_fps} FPS | 时长: {self.total_seconds:.1f}秒 | 音频: {os.path.basename(self.audio_file)}")
+                audio_label = os.path.basename(self.audio_file) if self.audio_file else "无音频"
+                detail_label.config(text=f"帧率: {export_fps} FPS | 时长: {self.total_seconds:.1f}秒 | 音频: {audio_label}")
                 progress_window.update()
                 
                 # 在主线程中预先获取 tkinter 变量的值（避免线程安全问题）
@@ -8934,15 +10241,20 @@ QQ：1248360754 小红书：5615193523"""
                     
                     # 创建视频剪辑
                     video_clip = ImageSequenceClip(frame_files, fps=export_fps)
-                    audio_clip = AudioFileClip(self.audio_file)
-                    
-                    # 确保音视频时长匹配
-                    if audio_clip.duration > video_clip.duration:
-                        audio_clip = audio_clip.subclipped(0, video_clip.duration)  # type: ignore
+                    audio_clip = None
+
+                    if self.audio_file:
+                        audio_clip = AudioFileClip(self.audio_file)
+
+                        # 确保音视频时长匹配
+                        if audio_clip.duration > video_clip.duration:
+                            audio_clip = audio_clip.subclipped(0, video_clip.duration)  # type: ignore
+                        else:
+                            video_clip = video_clip.with_duration(audio_clip.duration)  # type: ignore
+
+                        final_clip = video_clip.with_audio(audio_clip)  # type: ignore
                     else:
-                        video_clip = video_clip.with_duration(audio_clip.duration)  # type: ignore
-                    
-                    final_clip = video_clip.with_audio(audio_clip)  # type: ignore
+                        final_clip = video_clip
                     
                     # 更新状态
                     status_label.config(text="正在导出最终视频...")
@@ -8954,25 +10266,34 @@ QQ：1248360754 小红书：5615193523"""
                     # 确保ffmpeg可用（对于打包后的exe）
                     # moviepy会自动使用imageio_ffmpeg提供的ffmpeg
                     
-                    final_clip.write_videofile(
-                        export_path,
-                        codec='libx264',
-                        audio_codec='aac',
-                        fps=export_fps,
-                        preset='ultrafast',  # 使用最快的编码预设
-                        threads=min(cpu_count_for_encoding, 4),  # 使用多线程编码
-                        bitrate='2000k',
-                        audio_bitrate='128k',
-                        logger=None  # 禁用详细日志输出
-                    )
+                    write_options = {
+                        "codec": "libx264",
+                        "fps": export_fps,
+                        "preset": "ultrafast",  # 使用最快的编码预设
+                        "threads": min(cpu_count_for_encoding, 4),  # 使用多线程编码
+                        "bitrate": "2000k",
+                        "logger": None  # 禁用详细日志输出
+                    }
+                    if audio_clip is not None:
+                        write_options.update({
+                            "audio_codec": "aac",
+                            "audio_bitrate": "128k"
+                        })
+                    else:
+                        write_options["audio"] = False
+
+                    final_clip.write_videofile(export_path, **write_options)
                     
                     # 清理资源
                     final_clip.close()
-                    video_clip.close()
-                    audio_clip.close()
-                    
+                    if final_clip is not video_clip:
+                        video_clip.close()
+                    if audio_clip is not None:
+                        audio_clip.close()
+
                     # 显示成功消息
-                    self.log(f"✓ 带音频MP4导出成功: {os.path.basename(export_path)}", 'success')
+                    success_label = "带音频MP4" if self.audio_file else "无音频MP4"
+                    self.log(f"✓ {success_label}导出成功: {os.path.basename(export_path)}", 'success')
                     
                 except Exception as e:
                     raise Exception(f"导出过程中出错: {str(e)}")
@@ -9011,6 +10332,9 @@ QQ：1248360754 小红书：5615193523"""
         ax.set_ylim(-2, self.stage_height + backstage_height + 1)  # 包含后方备台区域
         
         # 设置固定的长宽比，确保舞台和对象不会变形
+        ax.set_aspect('equal', adjustable='box')
+
+        self.draw_stage_background(ax)
         ax.set_aspect('equal', adjustable='box')
         
         # 绘制舞台边界
@@ -9119,6 +10443,8 @@ QQ：1248360754 小红书：5615193523"""
                                zorder=0)
                         y_line_count += 1
                     y -= self.grid_interval_y
+
+            self.draw_custom_guides(ax, xlim=(x_start, x_end), ylim=(y_start, y_end), with_labels=False)
         
         # 绘制演员和道具
         self.render_actors(ax, current_frame, is_export)
@@ -9728,4 +11054,4 @@ QQ：1248360754 小红书：5615193523"""
 if __name__ == "__main__":
     root = tk.Tk()
     app = StageAnimationTool(root)
-    root.mainloop() 
+    root.mainloop()
