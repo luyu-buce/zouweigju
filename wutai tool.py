@@ -280,22 +280,23 @@ class StageAnimationTool:
         plt.rcParams['axes.grid'] = False
 
         self.root = root
-        self.root.title("舞台走位动画制作工具 v3.1 | @天云 免费制作及分享 | QQ:1248360754 | 小红书:5615193523")
+        self.root.title("舞台走位动画制作工具 v3.2 | @天云 免费制作及分享 | QQ:1248360754 | 小红书:5615193523")
 
-        # 设置窗口最小尺寸，避免内容变化导致窗口跳动
-        self.root.minsize(1500, 880)
-
-        # 设置窗口初始大小（不指定位置，让系统自动决定）
-        # 不使用 geometry() 设置位置，避免后续操作导致窗口跳动
-        # self.root.geometry("1500x940")
-
-        # 让窗口在屏幕上居中显示
-        window_width = 1500
-        window_height = 940
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = (screen_width - window_width) // 2
-        y = (screen_height - window_height) // 2
+
+        # 允许用户通过系统边框调整主窗口大小。旧版硬编码 1500x880 的最小尺寸，
+        # 在较小的 Win10 屏幕上会把窗口锁死，看起来像边框无法拖动。
+        self.root.resizable(True, True)
+        min_width = min(1100, max(800, screen_width - 80))
+        min_height = min(700, max(560, screen_height - 120))
+        self.root.minsize(min_width, min_height)
+
+        # 初始尺寸随屏幕可用空间收缩，避免窗口边框落到屏幕外。
+        window_width = min(1500, max(min_width, screen_width - 80))
+        window_height = min(940, max(min_height, screen_height - 120))
+        x = max((screen_width - window_width) // 2, 0)
+        y = max((screen_height - window_height) // 2, 0)
         # 只在首次启动时设置位置，之后不再修改
         self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
 
@@ -462,6 +463,7 @@ class StageAnimationTool:
         # 创建主框架
         self.main_frame = ttk.Frame(root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
+        self.panel_resize_state = None
 
         # 创建控制面板
         self.create_control_panel()
@@ -498,7 +500,7 @@ class StageAnimationTool:
 
         # 显示欢迎消息
         self.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", 'info')
-        self.log("舞台走位动画制作工具 v3.1", 'info')
+        self.log("舞台走位动画制作工具 v3.2", 'info')
         self.log("音频支持：WAV/MP3", 'info')
         self.log("快捷键：Ctrl+Z撤销 | Ctrl+Y重做 | 空格播放/暂停", 'info')
         self.log("快捷键：Ctrl+C / Ctrl+V复制对象 | Delete删除对象", 'info')
@@ -510,6 +512,67 @@ class StageAnimationTool:
 
         # 标记窗口初始化完成
         self.window_initialized = True
+
+    def create_panel_resize_handle(self, side, target_frame):
+        """Create a slim draggable handle beside the preview area."""
+        handle = tk.Frame(self.main_frame, width=6, bg="#c9c9c9", cursor="sb_h_double_arrow")
+        handle.pack_propagate(False)
+        if side == "left":
+            handle.pack(side=tk.LEFT, fill=tk.Y, pady=5)
+            self.left_resize_handle = handle
+        else:
+            handle.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+            self.right_resize_handle = handle
+
+        handle.bind("<Enter>", lambda e: handle.configure(bg="#9f9f9f"))
+        handle.bind("<Leave>", lambda e: handle.configure(bg="#c9c9c9"))
+        handle.bind("<ButtonPress-1>", lambda e: self.start_panel_resize(e, side, target_frame))
+        handle.bind("<B1-Motion>", self.resize_side_panel)
+        handle.bind("<ButtonRelease-1>", self.finish_panel_resize)
+
+    def start_panel_resize(self, event, side, target_frame):
+        self.panel_resize_state = {
+            "side": side,
+            "target": target_frame,
+            "start_x": event.x_root,
+            "start_width": target_frame.winfo_width(),
+        }
+        return "break"
+
+    def resize_side_panel(self, event):
+        if not self.panel_resize_state:
+            return "break"
+
+        state = self.panel_resize_state
+        side = state["side"]
+        target_frame = state["target"]
+        delta = event.x_root - state["start_x"]
+        new_width = state["start_width"] + delta if side == "left" else state["start_width"] - delta
+
+        root_width = max(self.root.winfo_width(), 1)
+        preview_min_width = 420
+        layout_padding = 50
+        left_width = self.control_frame.winfo_width() if hasattr(self, "control_frame") else 260
+        right_width = self.right_frame.winfo_width() if hasattr(self, "right_frame") else 390
+
+        if side == "left":
+            min_width = 180
+            max_width = root_width - right_width - preview_min_width - layout_padding
+        else:
+            min_width = 280
+            max_width = root_width - left_width - preview_min_width - layout_padding
+
+        max_width = max(min_width, max_width)
+        new_width = int(max(min_width, min(new_width, max_width)))
+        target_frame.configure(width=new_width)
+        target_frame.update_idletasks()
+        if hasattr(self, "canvas"):
+            self.canvas.draw_idle()
+        return "break"
+
+    def finish_panel_resize(self, event=None):
+        self.panel_resize_state = None
+        return "break"
 
     def save_state_to_history(self, operation_name="操作"):
         """保存当前状态到历史记录
@@ -749,6 +812,8 @@ class StageAnimationTool:
         control_frame = ttk.LabelFrame(self.main_frame, text="控制面板", width=260)
         control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
         control_frame.pack_propagate(False)  # 禁止子组件改变父容器大小
+        self.control_frame = control_frame
+        self.create_panel_resize_handle("left", control_frame)
 
         # 创建可滚动的Canvas（宽度相应调整）
         self.control_canvas = tk.Canvas(control_frame, width=240, highlightthickness=0)
@@ -2205,6 +2270,7 @@ class StageAnimationTool:
         # 创建中间区域的容器
         center_frame = ttk.Frame(self.main_frame)
         center_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.center_frame = center_frame
 
         # 创建舞台预览
         preview_frame = ttk.LabelFrame(center_frame, text="舞台预览")
@@ -2382,6 +2448,8 @@ class StageAnimationTool:
         right_frame = ttk.Frame(self.main_frame, width=390)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
         right_frame.pack_propagate(False)  # 禁止子组件改变父容器大小
+        self.right_frame = right_frame
+        self.create_panel_resize_handle("right", right_frame)
 
         # 创建关键帧编辑区域，限制最大高度
         keyframe_frame = ttk.LabelFrame(right_frame, text="关键帧编辑")
