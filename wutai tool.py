@@ -468,11 +468,11 @@ class StageAnimationTool:
         # 创建控制面板
         self.create_control_panel()
 
+        # 创建右侧面板
+        self.create_timeline()
+
         # 创建舞台预览
         self.create_stage_preview()
-
-        # 创建时间轴
-        self.create_timeline()
 
         # 添加动画循环
         self.animation_loop = AnimationLoop(self)
@@ -536,6 +536,9 @@ class StageAnimationTool:
             "target": target_frame,
             "start_x": event.x_root,
             "start_width": target_frame.winfo_width(),
+            "root_width": self.root.winfo_width(),
+            "left_width": self.control_frame.winfo_width() if hasattr(self, "control_frame") else 260,
+            "right_width": self.right_frame.winfo_width() if hasattr(self, "right_frame") else 460,
         }
         return "break"
 
@@ -549,17 +552,17 @@ class StageAnimationTool:
         delta = event.x_root - state["start_x"]
         new_width = state["start_width"] + delta if side == "left" else state["start_width"] - delta
 
-        root_width = max(self.root.winfo_width(), 1)
-        preview_min_width = 420
-        layout_padding = 50
-        left_width = self.control_frame.winfo_width() if hasattr(self, "control_frame") else 260
-        right_width = self.right_frame.winfo_width() if hasattr(self, "right_frame") else 390
+        root_width = max(state.get("root_width", self.root.winfo_width()), 1)
+        preview_min_width = 320
+        layout_padding = 80
+        left_width = state.get("left_width", 260)
+        right_width = state.get("right_width", 460)
 
         if side == "left":
             min_width = 180
             max_width = root_width - right_width - preview_min_width - layout_padding
         else:
-            min_width = 280
+            min_width = 360
             max_width = root_width - left_width - preview_min_width - layout_padding
 
         max_width = max(min_width, max_width)
@@ -2444,8 +2447,8 @@ class StageAnimationTool:
         self.volume_scale.pack(side=tk.LEFT, padx=2)
 
     def create_timeline(self):
-        # 创建右侧面板，设置固定宽度避免跳动（优化：减小宽度）
-        right_frame = ttk.Frame(self.main_frame, width=390)
+        # 创建右侧面板，设置固定宽度避免跳动
+        right_frame = ttk.Frame(self.main_frame, width=460)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
         right_frame.pack_propagate(False)  # 禁止子组件改变父容器大小
         self.right_frame = right_frame
