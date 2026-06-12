@@ -280,7 +280,7 @@ class StageAnimationTool:
         plt.rcParams['axes.grid'] = False
 
         self.root = root
-        self.root.title("舞台走位动画制作工具 v3.2 | @天云 免费制作及分享 | QQ:1248360754 | 小红书:5615193523")
+        self.root.title("舞台走位动画制作工具 v3.3 | @天云 免费制作及分享 | QQ:1248360754 | 小红书:5615193523")
 
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
@@ -500,7 +500,7 @@ class StageAnimationTool:
 
         # 显示欢迎消息
         self.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", 'info')
-        self.log("舞台走位动画制作工具 v3.2", 'info')
+        self.log("舞台走位动画制作工具 v3.3", 'info')
         self.log("音频支持：WAV/MP3", 'info')
         self.log("快捷键：Ctrl+Z撤销 | Ctrl+Y重做 | 空格播放/暂停", 'info')
         self.log("快捷键：Ctrl+C / Ctrl+V复制对象 | Delete删除对象", 'info')
@@ -2581,6 +2581,19 @@ class StageAnimationTool:
         self.export_fps_entry.insert(0, "10")  # 默认导出帧率
         self.export_fps_entry.pack(side=tk.LEFT, padx=2)
         ttk.Label(fps_row, text="FPS", foreground='gray').pack(side=tk.LEFT, padx=2)
+
+        quality_row = ttk.Frame(export_frame)
+        quality_row.pack(fill=tk.X, padx=5, pady=(0, 3))
+        ttk.Label(quality_row, text="清晰度:").pack(side=tk.LEFT, padx=2)
+        self.export_quality_var = tk.StringVar(value="高清 2000x1600")
+        self.export_quality_combo = ttk.Combobox(
+            quality_row,
+            textvariable=self.export_quality_var,
+            values=["普通 1000x800", "高清 2000x1600", "超清 3000x2400"],
+            width=14,
+            state="readonly"
+        )
+        self.export_quality_combo.pack(side=tk.LEFT, padx=2)
 
         # 导出操作按钮行
         export_row = ttk.Frame(export_frame)
@@ -9143,6 +9156,41 @@ class StageAnimationTool:
             # 恢复原来的值
             self.speed_var.set(f"{self.playback_speed:.2f}x")
 
+    def get_export_quality_settings(self):
+        quality = self.export_quality_var.get() if hasattr(self, "export_quality_var") else "高清 2000x1600"
+        if quality.startswith("超清"):
+            return {
+                "name": "超清",
+                "width": 3000,
+                "height": 2400,
+                "dpi": 300,
+                "bitrate": "12000k",
+                "preset": "medium",
+            }
+        if quality.startswith("普通"):
+            return {
+                "name": "普通",
+                "width": 1000,
+                "height": 800,
+                "dpi": 100,
+                "bitrate": "4000k",
+                "preset": "fast",
+            }
+        return {
+            "name": "高清",
+            "width": 2000,
+            "height": 1600,
+            "dpi": 200,
+            "bitrate": "8000k",
+            "preset": "fast",
+        }
+
+    def create_export_figure(self, quality_settings):
+        dpi = quality_settings["dpi"]
+        width = quality_settings["width"]
+        height = quality_settings["height"]
+        return Figure(figsize=(width / dpi, height / dpi), dpi=dpi)
+
     def export_animation(self):
         """导出动画为GIF文件"""
         # 检查动画是否正在播放
@@ -9158,6 +9206,13 @@ class StageAnimationTool:
             export_fps = int(self.export_fps_entry.get())
             if export_fps <= 0:
                 raise ValueError("导出帧率必须大于0")
+            quality_settings = self.get_export_quality_settings()
+            if quality_settings["name"] == "超清":
+                if not messagebox.askyesno(
+                    "确认超清GIF",
+                    "超清GIF会明显增加导出时间和文件大小，建议最终成片优先导出MP4。\n是否继续导出超清GIF？"
+                ):
+                    return
 
             # 创建导出目录
             export_dir = "exports"
@@ -9223,7 +9278,9 @@ class StageAnimationTool:
 
             # 显示项目信息
             progress_label.config(text=f"准备导出 {total_export_frames} 帧GIF动画")
-            frame_label.config(text=f"帧率: {export_fps} FPS | 时长: {self.total_seconds:.1f}秒")
+            frame_label.config(
+                text=f"帧率: {export_fps} FPS | {quality_settings['name']} {quality_settings['width']}x{quality_settings['height']}"
+            )
             progress_window.update()
 
             # 创建临时目录存储帧
@@ -9232,7 +9289,11 @@ class StageAnimationTool:
             # 在主线程中预先获取 tkinter 变量的值（避免线程安全问题）
             grid_enabled_value = self.grid_enabled.get()
 
-            print(f"[GIF导出] 总帧数={total_export_frames}, 帧率={export_fps}, 辅助线={'开启' if grid_enabled_value else '关闭'}")
+            print(
+                f"[GIF导出] 总帧数={total_export_frames}, 帧率={export_fps}, "
+                f"清晰度={quality_settings['name']} {quality_settings['width']}x{quality_settings['height']}, "
+                f"辅助线={'开启' if grid_enabled_value else '关闭'}"
+            )
 
             try:
                 # 单线程顺序渲染（避免 tkinter 线程安全问题）
@@ -9246,7 +9307,7 @@ class StageAnimationTool:
                     frame_path = os.path.join(temp_dir, f"frame_{frame:04d}.png")
 
                     # 创建图形对象
-                    export_fig = Figure(figsize=(10, 8), dpi=100)
+                    export_fig = self.create_export_figure(quality_settings)
                     export_ax = export_fig.add_subplot(111)
                     export_fig.patch.set_facecolor('white')
                     export_ax.set_facecolor('white')
@@ -9258,7 +9319,7 @@ class StageAnimationTool:
                     export_fig.savefig(frame_path,
                                       facecolor='white',
                                       edgecolor='none',
-                                      dpi=100,
+                                      dpi=quality_settings["dpi"],
                                       pad_inches=0)
                     plt.close(export_fig)
                     frame_files.append((frame, frame_path))
@@ -10663,6 +10724,7 @@ class StageAnimationTool:
             export_fps = int(self.export_fps_entry.get())
             if export_fps <= 0:
                 raise ValueError("导出帧率必须大于0")
+            quality_settings = self.get_export_quality_settings()
 
             # 创建临时目录
             temp_dir = tempfile.mkdtemp()
@@ -10715,13 +10777,22 @@ class StageAnimationTool:
                 # 显示项目信息
                 status_label.config(text=f"准备导出 {total_export_frames} 帧")
                 audio_label = os.path.basename(self.audio_file) if self.audio_file else "无音频"
-                detail_label.config(text=f"帧率: {export_fps} FPS | 时长: {self.total_seconds:.1f}秒 | 音频: {audio_label}")
+                detail_label.config(
+                    text=(
+                        f"帧率: {export_fps} FPS | {quality_settings['name']} "
+                        f"{quality_settings['width']}x{quality_settings['height']} | 音频: {audio_label}"
+                    )
+                )
                 progress_window.update()
 
                 # 在主线程中预先获取 tkinter 变量的值（避免线程安全问题）
                 grid_enabled_value = self.grid_enabled.get()
 
-                print(f"[MP4导出] 总帧数={total_export_frames}, 帧率={export_fps}, 辅助线={'开启' if grid_enabled_value else '关闭'}")
+                print(
+                    f"[MP4导出] 总帧数={total_export_frames}, 帧率={export_fps}, "
+                    f"清晰度={quality_settings['name']} {quality_settings['width']}x{quality_settings['height']}, "
+                    f"码率={quality_settings['bitrate']}, 辅助线={'开启' if grid_enabled_value else '关闭'}"
+                )
 
                 try:
                     frame_files = []
@@ -10736,7 +10807,7 @@ class StageAnimationTool:
                         frame_path = os.path.join(temp_dir, f"frame_{frame:04d}.png")
 
                         # 创建图形对象
-                        export_fig = Figure(figsize=(10, 8), dpi=100)
+                        export_fig = self.create_export_figure(quality_settings)
                         export_ax = export_fig.add_subplot(111)
                         export_fig.patch.set_facecolor('white')
                         export_ax.set_facecolor('white')
@@ -10748,7 +10819,7 @@ class StageAnimationTool:
                         export_fig.savefig(frame_path,
                                           facecolor='white',
                                           edgecolor='none',
-                                          dpi=100,
+                                          dpi=quality_settings["dpi"],
                                           pad_inches=0)
                         plt.close(export_fig)
                         frame_files.append(frame_path)
@@ -10809,9 +10880,9 @@ class StageAnimationTool:
                     write_options = {
                         "codec": "libx264",
                         "fps": export_fps,
-                        "preset": "ultrafast",  # 使用最快的编码预设
+                        "preset": quality_settings["preset"],
                         "threads": min(cpu_count_for_encoding, 4),  # 使用多线程编码
-                        "bitrate": "2000k",
+                        "bitrate": quality_settings["bitrate"],
                         "logger": None  # 禁用详细日志输出
                     }
                     if audio_clip is not None:
